@@ -3,10 +3,12 @@ package service
 import (
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/database"
+	"github.com/new-api-tools/backend/internal/logger"
 )
 
 // Constants for model status
@@ -72,7 +74,9 @@ func NewModelStatusService() *ModelStatusService {
 	return &ModelStatusService{db: database.Get()}
 }
 
-// GetAvailableModels returns all models with 24h request counts
+// GetAvailableModels returns all models from enabled channels with 24h request counts.
+// Uses abilities table as primary source (matching Python backend), enriched with log stats.
+// This ensures models show up even when LogConsumeEnabled is false or there are no recent logs.
 func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, error) {
 	cm := cache.Get()
 	var cached []map[string]interface{}
@@ -81,22 +85,78 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 		return cached, nil
 	}
 
-	startTime := time.Now().Unix() - 86400
+	// Step 1: Get all models from abilities table (enabled channels + enabled abilities)
+	enabledFilter := "a.enabled = 1"
+	if s.db.IsPG {
+		enabledFilter = "a.enabled = TRUE"
+	}
+	modelsQuery := s.db.RebindQuery(fmt.Sprintf(`
+		SELECT DISTINCT a.model as model_name
+		FROM abilities a
+		INNER JOIN channels c ON c.id = a.channel_id
+		WHERE c.status = 1 AND %s
+		ORDER BY a.model`, enabledFilter))
 
-	query := s.db.RebindQuery(`
-		SELECT model_name, COUNT(*) as request_count_24h
-		FROM logs
-		WHERE type IN (2, 5) AND model_name != '' AND created_at >= ?
-		GROUP BY model_name
-		ORDER BY request_count_24h DESC`)
-
-	rows, err := s.db.Query(query, startTime)
+	modelRows, err := s.db.Query(modelsQuery)
 	if err != nil {
+		logger.L.Warn("获取可用模型列表失败 (abilities): " + err.Error())
 		return nil, err
 	}
 
-	cm.Set("model_status:available_models", rows, 5*time.Minute)
-	return rows, nil
+	allModels := make([]string, 0, len(modelRows))
+	for _, row := range modelRows {
+		if name, ok := row["model_name"].(string); ok && name != "" {
+			allModels = append(allModels, name)
+		}
+	}
+
+	if len(allModels) == 0 {
+		empty := []map[string]interface{}{}
+		cm.Set("model_status:available_models", empty, 5*time.Minute)
+		return empty, nil
+	}
+
+	// Step 2: Enrich with 24h request counts from logs
+	startTime := time.Now().Unix() - 86400
+	statsQuery := s.db.RebindQuery(`
+		SELECT model_name, COUNT(*) as request_count
+		FROM logs
+		WHERE type IN (2, 5) AND model_name != '' AND created_at >= ?
+		GROUP BY model_name`)
+
+	statsRows, _ := s.db.Query(statsQuery, startTime) // stats are optional, don't fail on error
+
+	requestCounts := make(map[string]int64)
+	if statsRows != nil {
+		for _, row := range statsRows {
+			if name, ok := row["model_name"].(string); ok {
+				requestCounts[name] = toInt64(row["request_count"])
+			}
+		}
+	}
+
+	// Step 3: Merge and sort — models with requests first (by count desc), then alphabetically
+	results := make([]map[string]interface{}, 0, len(allModels))
+	for _, model := range allModels {
+		results = append(results, map[string]interface{}{
+			"model_name":        model,
+			"request_count_24h": requestCounts[model],
+		})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		ci := toInt64(results[i]["request_count_24h"])
+		cj := toInt64(results[j]["request_count_24h"])
+		if ci != cj {
+			return ci > cj
+		}
+		ni, _ := results[i]["model_name"].(string)
+		nj, _ := results[j]["model_name"].(string)
+		return ni < nj
+	})
+
+	cm.Set("model_status:available_models", results, 5*time.Minute)
+	return results, nil
 }
 
 // GetModelStatus returns status for a specific model
@@ -124,17 +184,17 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	// Single optimized query — aggregate by time slot using FLOOR division
 	// This reduces N queries to 1 query per model (matches Python backend)
 	//
-	// Success counting strategy:
-	//   - type=2 with completion_tokens > 0 → definite success
-	//   - type=2 with completion_tokens = 0 → empty response (likely failure)
-	//   - type=5 → explicit failure (if NewAPI version supports it)
-	// This ensures correct success rate even when NewAPI doesn't log type=5 failures.
+	// Success counting strategy (matches Python backend):
+	//   - type=2 → success (consumption/usage log)
+	//   - type=5 → failure (error log)
+	// Note: Previous version required completion_tokens > 0 for success,
+	// but this breaks for embeddings, image generation, and streaming models
+	// that may report 0 completion_tokens on successful requests.
 	slotQuery := s.db.RebindQuery(fmt.Sprintf(`
 		SELECT FLOOR((created_at - %d) / %d) as slot_idx,
 			COUNT(*) as total,
-			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
-			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty
+			SUM(CASE WHEN type = 2 THEN 1 ELSE 0 END) as success,
+			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure
 		FROM logs
 		WHERE model_name = ?
 			AND created_at >= ? AND created_at < ?
@@ -143,14 +203,16 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		startTime, slotSeconds,
 		startTime, slotSeconds))
 
-	rows, _ := s.db.Query(slotQuery, modelName, startTime, now)
+	rows, err := s.db.Query(slotQuery, modelName, startTime, now)
+	if err != nil {
+		logger.L.Warn(fmt.Sprintf("获取模型 %s 状态查询失败: %s", modelName, err.Error()))
+	}
 
 	// Initialize all slots with zeros
 	type slotInfo struct {
 		total   int64
 		success int64
 		failure int64
-		empty   int64
 	}
 	slotMap := make(map[int64]*slotInfo, numSlots)
 
@@ -163,7 +225,6 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 					total:   toInt64(row["total"]),
 					success: toInt64(row["success"]),
 					failure: toInt64(row["failure"]),
-					empty:   toInt64(row["empty"]),
 				}
 			}
 		}
@@ -174,7 +235,6 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	totalReqs := int64(0)
 	totalSuccess := int64(0)
 	totalFailure := int64(0)
-	totalEmpty := int64(0)
 
 	for i := 0; i < numSlots; i++ {
 		slotStart := startTime + int64(i)*slotSeconds
@@ -184,12 +244,10 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		slotTotal := int64(0)
 		slotSuccess := int64(0)
 		slotFailure := int64(0)
-		slotEmpty := int64(0)
 		if si != nil {
 			slotTotal = si.total
 			slotSuccess = si.success
 			slotFailure = si.failure
-			slotEmpty = si.empty
 		}
 
 		slotRate := float64(100)
@@ -204,7 +262,6 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 			"total_requests": slotTotal,
 			"success_count":  slotSuccess,
 			"failure_count":  slotFailure,
-			"empty_count":    slotEmpty,
 			"success_rate":   roundRate(slotRate),
 			"status":         getStatusColor(slotRate, slotTotal),
 		})
@@ -212,7 +269,6 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		totalReqs += slotTotal
 		totalSuccess += slotSuccess
 		totalFailure += slotFailure
-		totalEmpty += slotEmpty
 	}
 
 	overallRate := float64(100)
@@ -227,7 +283,6 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		"total_requests": totalReqs,
 		"success_count":  totalSuccess,
 		"failure_count":  totalFailure,
-		"empty_count":    totalEmpty,
 		"success_rate":   roundRate(overallRate),
 		"current_status": getStatusColor(overallRate, totalReqs),
 		"slot_data":      slotData,
@@ -278,14 +333,18 @@ func (s *ModelStatusService) GetTokenGroups() ([]map[string]interface{}, error) 
 
 	// 从 abilities 表获取分组及其模型列表（abilities 表定义了 group-model-channel 的映射）
 	groupCol := s.getGroupCol()
+	enabledFilter := "a.enabled = 1"
+	if s.db.IsPG {
+		enabledFilter = "a.enabled = TRUE"
+	}
 	query := s.db.RebindQuery(fmt.Sprintf(`
 		SELECT COALESCE(NULLIF(a.%s, ''), 'default') as group_name,
 			COUNT(DISTINCT a.model) as model_count
 		FROM abilities a
 		INNER JOIN channels c ON c.id = a.channel_id
-		WHERE c.status = 1
+		WHERE c.status = 1 AND %s
 		GROUP BY COALESCE(NULLIF(a.%s, ''), 'default')
-		ORDER BY model_count DESC`, groupCol, groupCol))
+		ORDER BY model_count DESC`, groupCol, enabledFilter, groupCol))
 
 	rows, err := s.db.Query(query)
 	if err != nil {
@@ -301,8 +360,8 @@ func (s *ModelStatusService) GetTokenGroups() ([]map[string]interface{}, error) 
 			SELECT DISTINCT a.model as model_name
 			FROM abilities a
 			INNER JOIN channels c ON c.id = a.channel_id
-			WHERE c.status = 1 AND COALESCE(NULLIF(a.%s, ''), 'default') = ?
-			ORDER BY a.model`, groupCol))
+			WHERE c.status = 1 AND %s AND COALESCE(NULLIF(a.%s, ''), 'default') = ?
+			ORDER BY a.model`, enabledFilter, groupCol))
 
 		modelRows, err := s.db.Query(modelsQuery, groupName)
 		if err != nil {
